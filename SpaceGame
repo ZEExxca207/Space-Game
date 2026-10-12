@@ -1,0 +1,1421 @@
+"""
+SPACE GAME v4  -  made by Claude A.I and ZEE
+
+HOW TO RUN: open this file in IDLE and press F5.
+Nothing to install (it only uses tkinter, which comes with Python).
+
+CONTROLS
+  Left / Right arrows (or A / D) = move your spaceship
+  SPACE (hold it)                = fire the blue cannons
+  F = switch between 30 and 60 FPS (use 30 if your laptop is slow)
+  P = pause      M = sound on/off      R = restart after Game Over / Win
+
+HOW IT WORKS
+  - Every level: kill the circle-ship minions, then a BIG BOSS arrives.
+  - Bosses also call in more minions while you fight them!
+  - Kill the boss = level cleared + a REWARD (faster cannons, +1 heart,
+    and an extra cannon every 5 levels).
+  - HARDCORE: you have 10 hearts. When they are gone, the game is over.
+  - Level 20 is the FINAL BOSS. Beat it and you win!
+
+WHAT'S NEW IN v4
+  - Much lighter on slow laptops: the background is one picture, bullets and
+    sparks are re-used instead of re-drawn, and sound plays in its own thread.
+  - FPS switch: 30 or 60 (press F any time). The game speed stays the same.
+  - Minecraft-hardcore-style pixel hearts (half hearts, white blink on damage).
+  - The game no longer closes on a bug: it prints the error and goes back to
+    the title screen.
+
+OPTIONAL BACKGROUND PICTURE
+  Save a space picture next to this file and name it  background.png
+  (PNG or GIF, about 600 x 700). If it is not there, the game makes its own
+  purple galaxy.
+"""
+
+import tkinter as tk
+import random
+import math
+import os
+import sys
+import time
+import io
+import wave
+import array
+import queue
+import atexit
+import shutil
+import tempfile
+import threading
+import traceback
+import subprocess
+from functools import lru_cache
+
+# ---------------------------------------------------------------
+# SETTINGS  (try changing these numbers to experiment!)
+# ---------------------------------------------------------------
+VERSION = "v4"
+WIDTH, HEIGHT = 600, 700
+DEFAULT_FPS = 30           # 30 or 60. You can also press F while playing.
+FPS_CHOICES = (30, 60)
+STEP = 1.0 / 60.0          # the game rules always run 60 times per second
+FINAL_LEVEL = 20           # last level (final boss)
+MAX_HP = 20                # health is counted in HALF hearts: 20 = 10 hearts
+START_HP = 20
+HEAL_PER_BOSS = 2          # a boss kill heals 2 half hearts = 1 heart
+HIT_INVULN = 60            # frames of protection after you get hit
+START_FIRE_DELAY = 7.0     # frames between shots. 7 = about 8.6 shots/sec
+FIRE_SPEEDUP = 0.95        # every boss kill makes the delay 5% shorter
+MIN_FIRE_DELAY = 3.0       # the fastest the cannons can ever get (20 shots/sec each)
+MAX_CANNONS = 4
+PLAYER_SPEED = 6.5
+BOSS_Y = 135               # how far down the boss hovers
+BACKGROUND_FILE = "background.png"
+
+# Where the cannon dots sit on the ship (x, y offsets from the ship centre)
+CANNON_POS = {
+    1: [(0, -33)],
+    2: [(-14, 3), (14, 3)],
+    3: [(0, -33), (-18, 7), (18, 7)],
+    4: [(-22, 10), (-11, 2), (11, 2), (22, 10)],
+}
+
+BOSS_NAMES = ["SCOUT", "WARDEN", "MANTA", "BULWARK", "CLAW", "STINGER", "RAVAGER",
+              "TITAN", "VIPER", "COLOSSUS", "NOVA", "HYDRA", "JUGGERNAUT", "PHANTOM",
+              "TYRANT", "LEVIATHAN", "OVERLORD", "ECLIPSE", "CRUSHER", "OMEGA PRIME"]
+
+# (dark hull colour, light plate colour, glowing light colour)
+BOSS_PALETTES = [
+    ("#3b2a6e", "#6a4fd1", "#ff5ad6"),
+    ("#244a6e", "#4f8fd1", "#5affd6"),
+    ("#6e2a3a", "#d14f6a", "#ffd65a"),
+    ("#2a6e45", "#4fd18a", "#faff5a"),
+    ("#6e5a2a", "#d1a84f", "#ff5a5a"),
+    ("#4a2a6e", "#a14fd1", "#5ad6ff"),
+]
+
+MINION_COLORS = ["#ff8a3d", "#ff4d8d", "#9b6bff", "#3dd6c6", "#ffd23d", "#5aa0ff"]
+STAR_COLORS = ["#ffffff", "#e6d6ff", "#c9a8ff", "#ffc2f0", "#b8ccff"]
+
+
+# ---------------------------------------------------------------
+# SMALL HELPERS
+# ---------------------------------------------------------------
+@lru_cache(maxsize=8192)
+def mix(c1, c2, t):
+    """Blend colour c1 into colour c2. t=0 gives c1, t=1 gives c2."""
+    t = max(0.0, min(1.0, t))
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+# ---------------------------------------------------------------
+# PIXEL HEARTS (Minecraft hardcore style)
+# A 9 x 9 pixel heart. B = outline, R = red, W = shine, S = shadow
+# ---------------------------------------------------------------
+HEART_MAP = [
+    "..BB.BB..",
+    ".BRRBRRB.",
+    "BRWWRRRRB",
+    "BRWRRRRRB",
+    "BRRRRRRSB",
+    ".BRRRRSB.",
+    "..BRRSB..",
+    "...BSB...",
+    "....B....",
+]
+HEART_ZOOM = 3                      # every heart pixel becomes 3 x 3 screen pixels
+HEART_SIZE = 9 * HEART_ZOOM
+HEARTS = MAX_HP // 2
+
+HEART_COLORS = {
+    # (filled?, blinking?) -> colours for B, R, W, S
+    (True, False): {"B": "#1b0a0f", "R": "#e5222d", "W": "#ffc9c9", "S": "#a3101b"},
+    (False, False): {"B": "#1b0a0f", "R": "#3a1218", "W": "#4a1c24", "S": "#2c0d12"},
+    (True, True): {"B": "#ffffff", "R": "#ff6b73", "W": "#ffffff", "S": "#ff3b46"},
+    (False, True): {"B": "#ffffff", "R": "#3a1218", "W": "#4a1c24", "S": "#2c0d12"},
+}
+
+
+def make_heart_image(kind, blink):
+    """kind is 'full', 'half' or 'empty'. Returns a PhotoImage."""
+    img = tk.PhotoImage(width=9, height=9)
+    for y, row in enumerate(HEART_MAP):
+        for x, ch in enumerate(row):
+            if ch == ".":
+                continue
+            filled = kind == "full" or (kind == "half" and x <= 4)
+            img.put(HEART_COLORS[(filled, blink)][ch], to=(x, y))
+    return img.zoom(HEART_ZOOM, HEART_ZOOM)
+
+
+# ---------------------------------------------------------------
+# A "SPACE-X STYLE" FONT
+# Every letter is drawn with straight lines on a grid (4 wide, 6 tall),
+# then stretched wide. That gives the squared, extended, rocket-company look
+# and it works on every computer (no font install needed).
+# ---------------------------------------------------------------
+GLYPHS = {}
+
+
+def _g(ch, width, *strokes):
+    GLYPHS[ch] = (width, strokes)
+
+
+_g("A", 4, [(0, 6), (0, 1), (1, 0), (3, 0), (4, 1), (4, 6)], [(0, 3.6), (4, 3.6)])
+_g("B", 4, [(0, 0), (3, 0), (4, 1), (4, 2.2), (3.2, 3), (4, 3.8), (4, 5), (3, 6), (0, 6), (0, 0)], [(0, 3), (3.2, 3)])
+_g("C", 4, [(4, 1), (3, 0), (1, 0), (0, 1), (0, 5), (1, 6), (3, 6), (4, 5)])
+_g("D", 4, [(0, 0), (2.8, 0), (4, 1.2), (4, 4.8), (2.8, 6), (0, 6), (0, 0)])
+_g("E", 4, [(4, 0), (0, 0), (0, 6), (4, 6)], [(0, 3), (3, 3)])
+_g("F", 4, [(4, 0), (0, 0), (0, 6)], [(0, 3), (3, 3)])
+_g("G", 4, [(4, 1), (3, 0), (1, 0), (0, 1), (0, 5), (1, 6), (3, 6), (4, 5), (4, 3.2), (2.2, 3.2)])
+_g("H", 4, [(0, 0), (0, 6)], [(4, 0), (4, 6)], [(0, 3), (4, 3)])
+_g("I", 0, [(0, 0), (0, 6)])
+_g("J", 4, [(4, 0), (4, 5), (3, 6), (1, 6), (0, 5)])
+_g("K", 4, [(0, 0), (0, 6)], [(4, 0), (0, 3), (4, 6)])
+_g("L", 4, [(0, 0), (0, 6), (4, 6)])
+_g("M", 5, [(0, 6), (0, 0), (2.5, 3), (5, 0), (5, 6)])
+_g("N", 4, [(0, 6), (0, 0), (4, 6), (4, 0)])
+_g("O", 4, [(1, 0), (3, 0), (4, 1), (4, 5), (3, 6), (1, 6), (0, 5), (0, 1), (1, 0)])
+_g("P", 4, [(0, 6), (0, 0), (3, 0), (4, 1), (4, 2.2), (3, 3.2), (0, 3.2)])
+_g("Q", 4, [(1, 0), (3, 0), (4, 1), (4, 5), (3, 6), (1, 6), (0, 5), (0, 1), (1, 0)], [(2.4, 4.2), (4, 6.4)])
+_g("R", 4, [(0, 6), (0, 0), (3, 0), (4, 1), (4, 2.2), (3, 3.2), (0, 3.2)], [(2, 3.2), (4, 6)])
+_g("S", 4, [(4, 1), (3, 0), (1, 0), (0, 1), (0, 2.2), (1, 3), (3, 3), (4, 3.8), (4, 5), (3, 6), (1, 6), (0, 5)])
+_g("T", 4, [(0, 0), (4, 0)], [(2, 0), (2, 6)])
+_g("U", 4, [(0, 0), (0, 5), (1, 6), (3, 6), (4, 5), (4, 0)])
+_g("V", 4, [(0, 0), (2, 6), (4, 0)])
+_g("W", 6, [(0, 0), (1.5, 6), (3, 2), (4.5, 6), (6, 0)])
+_g("X", 4, [(0, 0), (4, 6)], [(4, 0), (0, 6)])
+_g("Y", 4, [(0, 0), (2, 3), (4, 0)], [(2, 3), (2, 6)])
+_g("Z", 4, [(0, 0), (4, 0), (0, 6), (4, 6)])
+_g("0", 4, [(1, 0), (3, 0), (4, 1), (4, 5), (3, 6), (1, 6), (0, 5), (0, 1), (1, 0)], [(3.4, 0.8), (0.6, 5.2)])
+_g("1", 3, [(0.5, 1), (2, 0), (2, 6)])
+_g("2", 4, [(0, 1), (1, 0), (3, 0), (4, 1), (4, 2.2), (0, 6), (4, 6)])
+_g("3", 4, [(0, 0), (4, 0), (2, 2.8), (3.2, 3), (4, 4), (4, 5), (3, 6), (1, 6), (0, 5)])
+_g("4", 4, [(3, 6), (3, 0), (0, 4), (4, 4)])
+_g("5", 4, [(4, 0), (0, 0), (0, 3), (3, 3), (4, 4), (4, 5), (3, 6), (0, 6)])
+_g("6", 4, [(4, 0), (1, 0), (0, 1), (0, 5), (1, 6), (3, 6), (4, 5), (4, 4), (3, 3), (0, 3)])
+_g("7", 4, [(0, 0), (4, 0), (1.5, 6)])
+_g("8", 4, [(1, 0), (3, 0), (4, 1), (4, 2), (3, 3), (1, 3), (0, 2), (0, 1), (1, 0)],
+   [(1, 3), (3, 3), (4, 4), (4, 5), (3, 6), (1, 6), (0, 5), (0, 4), (1, 3)])
+_g("9", 4, [(0, 6), (3, 6), (4, 5), (4, 1), (3, 0), (1, 0), (0, 1), (0, 2), (1, 3), (4, 3)])
+_g(".", 0.6, [(0, 5.4), (0.6, 5.4), (0.6, 6), (0, 6), (0, 5.4)])
+_g("!", 0.6, [(0.3, 0), (0.3, 3.8)], [(0.3, 5.2), (0.3, 6)])
+_g("-", 3, [(0, 3), (3, 3)])
+
+LETTER_GAP = 1.5
+
+
+def text_units(text):
+    total = 0
+    for ch in text:
+        total += 3 if ch == " " else GLYPHS.get(ch, (4, ()))[0] + LETTER_GAP
+    return total - LETTER_GAP
+
+
+def stroke_text(c, text, cx, cy, ux, uy, color, glow=None, width=3,
+                tags=("dyn",), glow_tags=None):
+    """Draw text in the SpaceX-style line font. ux/uy = size of one grid unit."""
+    text = text.upper()
+    x = cx - text_units(text) * ux / 2
+    top = cy - 3 * uy
+    lines = []
+    for ch in text:
+        if ch == " ":
+            x += 3 * ux
+            continue
+        w, strokes = GLYPHS.get(ch, (4, ()))
+        for s in strokes:
+            flat = []
+            for px, py in s:
+                flat += [x + px * ux, top + py * uy]
+            lines.append(flat)
+        x += (w + LETTER_GAP) * ux
+    if glow:  # soft glow behind the letters
+        for flat in lines:
+            c.create_line(flat, fill=glow, width=width + 6, capstyle="round",
+                          joinstyle="round", tags=glow_tags or tags)
+    for flat in lines:
+        c.create_line(flat, fill=color, width=width, capstyle="round",
+                      joinstyle="round", tags=tags)
+
+
+# ---------------------------------------------------------------
+# POOL: re-use canvas items instead of deleting and re-creating them
+# (creating hundreds of items every frame is what makes slow laptops lag)
+# ---------------------------------------------------------------
+class Pool:
+    def __init__(self, canvas, kind, **opts):
+        self.c = canvas
+        self.make = {"line": canvas.create_line, "oval": canvas.create_oval,
+                     "rect": canvas.create_rectangle}[kind]
+        self.opts = opts
+        self.ids = []
+        self.cols = []
+        self.shown = 0
+
+    def update(self, shapes, colors=None):
+        c = self.c
+        n = len(shapes)
+        while len(self.ids) < n:
+            self.ids.append(self.make(0, 0, 1, 1, state="hidden", **self.opts))
+            self.cols.append(None)
+        for i in range(n):
+            c.coords(self.ids[i], *shapes[i])
+            if colors is not None and self.cols[i] != colors[i]:
+                c.itemconfigure(self.ids[i], fill=colors[i])
+                self.cols[i] = colors[i]
+        for i in range(self.shown, n):
+            c.itemconfigure(self.ids[i], state="normal")
+        for i in range(n, self.shown):
+            c.itemconfigure(self.ids[i], state="hidden")
+        self.shown = n
+
+
+# ---------------------------------------------------------------
+# SOUND  (made from scratch, no sound files needed)
+# It is built and played in a separate thread, so it can never slow the game.
+# ---------------------------------------------------------------
+RATE = 11025
+
+
+def _tone(f0, f1, dur, vol=0.4, kind="square", decay=2.0):
+    """One beep that slides from frequency f0 to f1."""
+    n = int(RATE * dur)
+    out = []
+    phase = 0.0
+    prev = 0.0
+    for i in range(n):
+        p = i / n
+        phase += (f0 + (f1 - f0) * p) / RATE
+        ph = phase % 1.0
+        if kind == "square":
+            s = 1.0 if ph < 0.5 else -1.0
+        elif kind == "pulse":
+            s = 1.0 if ph < 0.25 else -1.0
+        elif kind == "sine":
+            s = math.sin(2 * math.pi * ph)
+        else:  # rumbling noise
+            prev = 0.7 * prev + 0.3 * random.uniform(-1, 1)
+            s = prev * 2.2
+        env = (1 - p) ** decay
+        env *= min(1.0, i / (RATE * 0.004))      # tiny fade-in so it does not click
+        out.append(s * vol * env)
+    return out
+
+
+def _notes(seq, kind="square", vol=0.3, decay=0.6):
+    out = []
+    for freq, dur in seq:
+        out += [0.0] * int(RATE * dur) if freq == 0 else _tone(freq, freq, dur, vol, kind, decay)
+    return out
+
+
+def _wav_bytes(samples):
+    pcm = array.array("h", [int(max(-1.0, min(1.0, s)) * 32000) for s in samples])
+    if sys.byteorder == "big":
+        pcm.byteswap()
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(pcm.tobytes())
+    return buf.getvalue()
+
+
+class Sound:
+    """Makes a few little 8-bit sound effects and plays them."""
+
+    GAPS = {"shoot": 0.14, "boom": 0.07, "hurt": 0.2, "fanfare": 0.5,
+            "win": 0.5, "gameover": 0.5, "start": 0.5}
+
+    def __init__(self):
+        self.enabled = True
+        self.mode = None
+        self.ready = False
+        self.busy_until = 0.0
+        self.last = {}
+        self.data = {}
+        self.length = {}
+        self.paths = {}
+        self.folder = None
+        self.q = queue.Queue()
+
+        if sys.platform.startswith("win"):
+            try:
+                import winsound
+                self.winsound = winsound
+                self.mode = "win"
+            except ImportError:
+                pass
+        elif sys.platform == "darwin":
+            if shutil.which("afplay"):
+                self.mode = "cmd"
+                self.cmd = ["afplay"]
+        else:
+            for player in (["paplay"], ["aplay", "-q"]):
+                if shutil.which(player[0]):
+                    self.mode = "cmd"
+                    self.cmd = player
+                    break
+        if self.mode:
+            threading.Thread(target=self._worker, daemon=True).start()
+
+    def build(self):
+        C5, E5, G5, C6, E6, G6 = 523, 659, 784, 1047, 1319, 1568
+        fanfare = _notes([(C5, .07), (E5, .07), (G5, .07), (C6, .07), (G5, .07), (C6, .07),
+                          (E6, .13), (C6, .07), (E6, .07), (G6, .50)], "square", 0.28, 0.5)
+        win = _notes([(C5, .09), (E5, .09), (G5, .09), (C6, .09), (E6, .09), (G6, .18),
+                      (E6, .09), (G6, .09), (C6, .09), (E6, .09), (G6, .09), (1760, .18),
+                      (G6, .09), (1760, .09), (2093, .7)], "square", 0.28, 0.5)
+        sad = _notes([(392, .2), (370, .2), (349, .2), (330, .6)], "pulse", 0.35, 1.0)
+        boom = [a + b for a, b in zip(_tone(0, 0, 0.22, 0.3, "noise", 2.4),
+                                      _tone(190, 50, 0.22, 0.28, "sine", 1.5))]
+        sounds = {
+            "shoot": _tone(1500, 650, 0.07, 0.28, "square", 2.0),
+            "boom": boom,
+            "hurt": _tone(320, 80, 0.35, 0.4, "square", 1.2),
+            "fanfare": fanfare,
+            "win": win,
+            "gameover": sad,
+            "start": _tone(300, 1300, 0.35, 0.3, "square", 1.0)
+                     + _notes([(1568, .12), (2093, .3)], "square", 0.25, 0.8),
+        }
+        for name, samples in sounds.items():
+            self.data[name] = _wav_bytes(samples)
+            self.length[name] = len(samples) / RATE
+            self.last[name] = 0.0
+
+    def _worker(self):
+        try:
+            self.build()
+            if self.mode == "cmd":
+                self.folder = tempfile.mkdtemp(prefix="spacegame_")
+                atexit.register(shutil.rmtree, self.folder, True)
+                for name, wav in self.data.items():
+                    self.paths[name] = os.path.join(self.folder, name + ".wav")
+                    with open(self.paths[name], "wb") as f:
+                        f.write(wav)
+            self.ready = True
+        except Exception:
+            self.mode = None
+            return
+        while True:
+            name = self.q.get()
+            if name is None:
+                return
+            try:
+                if self.mode == "win":
+                    self.winsound.PlaySound(self.data[name], self.winsound.SND_MEMORY)
+                elif self.mode == "cmd":
+                    subprocess.run(self.cmd + [self.paths[name]], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+            except Exception:
+                self.mode = None            # sound is broken here, just stay silent
+                return
+
+    def play(self, name, priority=False):
+        """priority sounds (fanfare, hurt...) are never skipped because of shooting."""
+        if not self.enabled or not self.ready or not self.mode:
+            return
+        now = time.time()
+        if not priority and (now < self.busy_until or self.q.qsize() > 1):
+            return
+        if now - self.last[name] < self.GAPS[name]:
+            return
+        self.last[name] = now
+        if priority:
+            self.busy_until = now + self.length[name]
+            try:
+                while True:                  # throw away sounds that are still waiting
+                    self.q.get_nowait()
+            except queue.Empty:
+                pass
+        self.q.put(name)
+
+    def stop(self):
+        try:
+            while True:
+                self.q.get_nowait()
+        except queue.Empty:
+            pass
+        if self.mode == "win":
+            try:
+                self.winsound.PlaySound(None, self.winsound.SND_PURGE)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------
+# THE GAME
+# ---------------------------------------------------------------
+class Game:
+    def __init__(self, root):
+        self.root = root
+        root.title("SpaceGame %s - made by Claude A.I and ZEE" % VERSION)
+        root.resizable(False, False)
+
+        self.canvas = tk.Canvas(root, width=WIDTH, height=HEIGHT,
+                                bg="#07030f", highlightthickness=0)
+        self.canvas.pack()
+        self.sound = Sound()
+
+        self.fps = DEFAULT_FPS if DEFAULT_FPS in FPS_CHOICES else 30
+        self.fps_now = 0
+        self.draw_count = 0
+        self.errors = 0
+        self.good_frames = 0
+        self.t = 0                 # game-step counter (60 per second)
+        self.paused = False
+        self.state = "title"       # title / playing / reward / gameover / win
+        self.scene = None
+        self.blink = None
+        self.text_cache = {}
+
+        self.make_background()
+        self.make_stars()
+        self.reset()
+        self.build_pools()
+        self.build_title()
+        self.build_hud()
+        self.refresh_fps_text()
+
+        self.keys = set()
+        root.bind("<KeyPress>", self.key_down)
+        root.bind("<KeyRelease>", self.key_up)
+        root.bind("<FocusOut>", self.focus_out)
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.focus_force()
+
+        self.running = True
+        self.acc = 0.0
+        self.last_tick = time.perf_counter()
+        self.fps_clock = self.last_tick
+        self.loop()
+
+    # -----------------------------------------------------------
+    # Background: ONE picture (purple galaxy, or your own file)
+    # -----------------------------------------------------------
+    def make_background(self):
+        c = self.canvas
+        self.bg_photo = None
+        folder = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(folder, BACKGROUND_FILE)
+        if os.path.exists(path):
+            try:
+                self.bg_photo = tk.PhotoImage(file=path)
+            except tk.TclError:
+                self.bg_photo = None
+        if self.bg_photo is None:
+            try:
+                self.bg_photo = self.make_galaxy()
+            except Exception:
+                traceback.print_exc()
+        if self.bg_photo is not None:
+            c.create_image(0, 0, image=self.bg_photo, anchor="nw", tags="bg")
+
+    def make_galaxy(self):
+        """Paint a small purple galaxy picture once, then zoom it up (fast!)."""
+        w, h, z = 200, 234, 3
+        top, bot = (5, 2, 13), (38, 16, 72)
+        # (centre x, centre y, radius, colour, strength) in small-picture pixels
+        blobs = [(50, 63, 66, (138, 43, 226), 0.55), (157, 110, 80, (75, 44, 201), 0.50),
+                 (100, 190, 73, (192, 38, 156), 0.50), (23, 173, 50, (90, 47, 208), 0.45),
+                 (177, 23, 50, (161, 58, 232), 0.50), (107, 110, 37, (122, 47, 208), 0.40)]
+        band_col = (170, 110, 235)
+        rows = []
+        for y in range(h):
+            g = (y / h) ** 1.3
+            R = [top[0] + (bot[0] - top[0]) * g] * w
+            G = [top[1] + (bot[1] - top[1]) * g] * w
+            B = [top[2] + (bot[2] - top[2]) * g] * w
+            for bx, by, rad, col, k in blobs:                 # nebula clouds
+                dy = (y - by) / (rad * 0.8)
+                if abs(dy) >= 1:
+                    continue
+                half = rad * math.sqrt(1 - dy * dy)
+                for x in range(max(0, int(bx - half)), min(w, int(bx + half) + 1)):
+                    dx = (x - bx) / rad
+                    d = dx * dx + dy * dy
+                    if d < 1:
+                        f = (1 - d) ** 2 * k
+                        R[x] += (col[0] - R[x]) * f
+                        G[x] += (col[1] - G[x]) * f
+                        B[x] += (col[2] - B[x]) * f
+            c0 = 0.67 * 100 + 0.74 * 117                      # a soft band across the sky
+            xa = int((c0 - 0.74 * y - 36) / 0.67)
+            xb = int((c0 - 0.74 * y + 36) / 0.67)
+            for x in range(max(0, xa), min(w, xb + 1)):
+                n = (x * 0.67 + y * 0.74 - c0) / 36.0
+                if abs(n) < 1:
+                    f = (1 - n * n) * 0.22
+                    R[x] += (band_col[0] - R[x]) * f
+                    G[x] += (band_col[1] - G[x]) * f
+                    B[x] += (band_col[2] - B[x]) * f
+            rows.append("{" + " ".join("#%02x%02x%02x" % (int(R[x]), int(G[x]), int(B[x]))
+                                       for x in range(w)) + "}")
+        small = tk.PhotoImage(width=w, height=h)
+        small.put(" ".join(rows), to=(0, 0))
+        big = small.zoom(z, z)
+        rng = random.Random(7)                                # tiny dust stars, painted in
+        for _ in range(240):
+            tt = rng.random()
+            x = int(tt * (WIDTH + 100) - 50)
+            y = int((1 - tt) * HEIGHT * 0.9 + rng.gauss(0, 55))
+            if 0 <= x < w * z and 0 <= y < h * z:
+                big.put(rng.choice(["#8e6bd8", "#b48cf0", "#e0b4ff", "#6a52b8"]), to=(x, y))
+        return big
+
+    def make_stars(self):
+        c = self.canvas
+        self.stars = []                     # moving stars (they scroll down)
+        for _ in range(55):
+            size = random.choice([1, 1, 2, 2, 3])
+            x, y = random.randint(0, WIDTH), random.randint(0, HEIGHT)
+            item = c.create_oval(x, y, x + size, y + size, fill=random.choice(STAR_COLORS),
+                                 outline="", tags="bg")
+            self.stars.append([item, x, y, 0.3 + size * 0.45, size])
+
+    def update_stars(self):
+        for s in self.stars:
+            s[2] += s[3]
+            if s[2] > HEIGHT:
+                s[2] = -4
+                s[1] = random.randint(0, WIDTH)
+
+    def draw_stars(self):
+        c = self.canvas
+        for item, x, y, speed, size in self.stars:
+            c.coords(item, x, y, x + size, y + size)
+
+    # -----------------------------------------------------------
+    # Things that are created once and then only changed
+    # -----------------------------------------------------------
+    def build_pools(self):
+        c = self.canvas
+        self.pool_mine = Pool(c, "line", fill="#3fa9ff", width=4, capstyle="round", tags="pool")
+        self.pool_theirs = Pool(c, "oval", fill="#ff3d7f", outline="#ffd0e0", tags="pool")
+        self.pool_sparks = Pool(c, "rect", fill="#ffffff", outline="", tags="pool")
+
+    def build_hud(self):
+        c = self.canvas
+        f12 = ("Arial", 12, "bold")
+        f10 = ("Arial", 10, "bold")
+        self.hud_level = c.create_text(12, 12, anchor="w", fill="#ffffff", font=f12, tags="hud")
+        self.hud_score = c.create_text(WIDTH - 12, 12, anchor="e", fill="#ffffff", font=f12, tags="hud")
+        self.hud_info = c.create_text(WIDTH - 12, HEIGHT - 44, anchor="e", fill="#8fd0ff",
+                                     font=f10, tags="hud")
+        self.hud_fps = c.create_text(WIDTH - 12, HEIGHT - 26, anchor="e", fill="#b8a0e8",
+                                     font=("Arial", 10), tags="hud")
+        # the hearts (hardcore style): 10 hearts = 20 half hearts
+        self.heart_imgs = {}
+        for kind in ("full", "half", "empty"):
+            for blink in (False, True):
+                self.heart_imgs[(kind, blink)] = make_heart_image(kind, blink)
+        self.heart_pos = [(14 + i * (HEART_SIZE + 3), HEIGHT - HEART_SIZE - 12) for i in range(HEARTS)]
+        self.heart_items = [c.create_image(x, y, image=self.heart_imgs[("full", False)],
+                                           anchor="nw", tags="hud") for x, y in self.heart_pos]
+        self.heart_shown = [("full", False)] * HEARTS
+        self.hearts_shaking = False
+
+    def build_title(self):
+        c = self.canvas
+        mid = WIDTH / 2
+        # a big planet and a moon in the corner
+        for i in range(12):
+            r = 150 * (1 - i / 12)
+            c.create_oval(500 - i * 3 - r, 640 - i * 3 - r, 500 - i * 3 + r, 640 - i * 3 + r,
+                          fill=mix("#2a0f5a", "#d68bff", i / 12), outline="", tags="title")
+        for i in range(8):
+            r = 28 * (1 - i / 8)
+            c.create_oval(90 - i * 1.5 - r, 470 - i * 1.5 - r, 90 - i * 1.5 + r, 470 - i * 1.5 + r,
+                          fill=mix("#3a4a7a", "#e8f0ff", i / 8), outline="", tags="title")
+        # the title, in the SpaceX-style letters
+        stroke_text(c, "SPACEGAME", mid, 120, 11, 12, "#ffffff", "#5a2fd0", 4,
+                    tags=("title",), glow_tags=("title", "tglow"))
+        stroke_text(c, "MADE BY CLAUDE A.I AND ZEE", mid, 205, 3.4, 4, "#d8b8ff", "#3a1a70", 2,
+                    tags=("title",))
+        stroke_text(c, "PRESS SPACE TO START", mid, 470, 4.2, 4.8, "#ffe066", "#6a4a10", 3,
+                    tags=("title", "press"))
+        c.create_text(WIDTH - 10, 10, text=VERSION, anchor="ne", fill="#b8a0e8",
+                      font=("Arial", 11, "bold"), tags="title")
+        self.title_fps = c.create_text(mid, 640, fill="#ffd966", font=("Arial", 11, "bold"), tags="title")
+        c.create_text(mid, 668, tags="title", fill="#b8a0e8", font=("Arial", 10),
+                      text="ARROWS / A D = MOVE     SPACE = SHOOT     P = PAUSE     M = SOUND")
+        self.title_sound = c.create_text(mid, 685, fill="#8070a8", font=("Arial", 9), tags="title",
+                                         text="")
+
+    def sync_scene(self):
+        """Show the title items on the title screen, the HUD while playing."""
+        scene = "title" if self.state == "title" else "game"
+        if scene != self.scene:
+            self.scene = scene
+            c = self.canvas
+            c.itemconfigure("title", state="normal" if scene == "title" else "hidden")
+            c.itemconfigure("hud", state="hidden" if scene == "title" else "normal")
+            self.blink = None
+
+    def set_text(self, item, s):
+        if self.text_cache.get(item) != s:
+            self.text_cache[item] = s
+            self.canvas.itemconfigure(item, text=s)
+
+    def refresh_fps_text(self):
+        other = 60 if self.fps == 30 else 30
+        self.set_text(self.hud_fps, "%d FPS (now %d)   F = switch" % (self.fps, self.fps_now))
+        self.set_text(self.title_fps, "FPS: %d     press  F  for %d FPS" % (self.fps, other))
+
+    # -----------------------------------------------------------
+    # Starting a game / a level
+    # -----------------------------------------------------------
+    def reset(self):
+        self.level = 1
+        self.score = 0
+        self.hp = START_HP
+        self.hit_flash = 0
+        self.fire_delay = START_FIRE_DELAY
+        self.cannons = 1
+        self.cleared = 0
+        self.px, self.py = WIDTH / 2, HEIGHT - 85
+        self.invuln = 0
+        self.cooldown = 0.0
+        self.reward_lines = []
+        self.reward_timer = 0
+        self.particles = []
+        self.demo_bullets = []
+        self.banner = 0
+        self.to_spawn = 0
+        self.spawn_timer = 0
+        self.clear_field()
+
+    def clear_field(self):
+        self.enemies = []
+        self.bullets = []          # your blue shots
+        self.enemy_bullets = []    # their shots
+        self.boss = None
+
+    def start_game(self):
+        self.reset()
+        self.state = "playing"
+        self.paused = False
+        self.start_level()
+        self.sound.play("start", True)
+
+    def start_level(self):
+        self.state = "playing"
+        self.clear_field()
+        self.to_spawn = min(24, 4 + self.level)     # circle minions this level
+        self.spawn_timer = 50
+        self.cooldown = 0.0
+        self.banner = 110
+
+    def boss_health(self, lvl):
+        """How tough is the boss? We work out how much damage per second your
+        ship does at this level, then give the boss enough health to last a
+        fair fight (longer fights on later levels)."""
+        delay = max(MIN_FIRE_DELAY, START_FIRE_DELAY * FIRE_SPEEDUP ** (lvl - 1))
+        cannons = min(MAX_CANNONS, 1 + (lvl - 1) // 5)
+        dps = cannons * 60.0 / delay
+        seconds = 7 + 1.3 * lvl
+        hp = dps * seconds * 0.45          # 0.45 = we expect ~half your shots to hit
+        if lvl == FINAL_LEVEL:
+            hp *= 1.6
+        return int(hp)
+
+    def make_boss(self):
+        lvl = self.level
+        final = lvl == FINAL_LEVEL
+        hp = self.boss_health(lvl)
+        self.boss = {
+            "x": WIDTH / 2, "y": -140.0, "t": 0, "arrived": False,
+            "w": 190 + lvl * 4 if not final else 250,
+            "h": 110 + lvl * 2 if not final else 150,
+            "home_y": BOSS_Y + (25 if final else 0),
+            "hp": hp, "max_hp": hp, "flash": 0, "flash_cd": 0, "dir": 1,
+            "speed": 1.4 + lvl * 0.1,
+            "attack_timer": 90, "attacks": 0, "summon": 300,
+        }
+        self.banner = 120
+
+    def spawn_minion(self, x, y):
+        lvl = self.level
+        self.enemies.append({
+            "x": x, "y": y, "x0": x, "t": random.randint(0, 100),
+            "amp": random.randint(20, 70),
+            "hp": 1 + lvl // 6,
+            "speed": 1.2 + lvl * 0.08,
+            "shoot": random.randint(60, 150),
+            "color": MINION_COLORS[(lvl - 1) % len(MINION_COLORS)],
+        })
+
+    # -----------------------------------------------------------
+    # Keyboard
+    # -----------------------------------------------------------
+    def key_down(self, event):
+        key = event.keysym.lower()
+        self.keys.add(key)
+        if self.state == "title" and key in ("space", "return"):
+            self.start_game()
+        elif key == "r" and self.state in ("gameover", "win"):
+            self.start_game()
+        elif key == "f":
+            self.fps = 60 if self.fps == 30 else 30
+            self.refresh_fps_text()
+        elif key == "m":
+            self.sound.enabled = not self.sound.enabled
+            if not self.sound.enabled:
+                self.sound.stop()
+        elif key == "p" and self.state == "playing":
+            self.paused = not self.paused
+
+    def key_up(self, event):
+        self.keys.discard(event.keysym.lower())
+
+    def focus_out(self, event):
+        """If you click another window, let go of all keys and pause."""
+        if event.widget is self.root:
+            self.keys.clear()
+            if self.state == "playing":
+                self.paused = True
+
+    def close(self):
+        self.running = False
+        self.sound.stop()
+        self.root.destroy()
+
+    # -----------------------------------------------------------
+    # Main loop.  The RULES run exactly 60 times per second, always.
+    # Only the DRAWING happens at 30 or 60 FPS (your choice), and if the
+    # laptop is slow the drawing is skipped so the game never slows down.
+    # -----------------------------------------------------------
+    def loop(self):
+        if not self.running:
+            return
+        now = time.perf_counter()
+        self.acc += min(now - self.last_tick, 0.25)
+        self.last_tick = now
+        try:
+            steps = 0
+            while self.acc >= STEP and steps < 5:
+                self.update()
+                self.acc -= STEP
+                steps += 1
+            if steps == 5:
+                self.acc = 0.0              # too slow to catch up: forget the backlog
+            self.draw()
+            self.draw_count += 1
+            if now - self.fps_clock >= 1.0:
+                self.fps_now = self.draw_count
+                self.draw_count = 0
+                self.fps_clock = now
+                self.refresh_fps_text()
+            self.good_frames += 1
+            if self.good_frames > 120:
+                self.errors = 0
+        except tk.TclError:
+            return                          # the window was closed
+        except Exception:
+            # A bug must never throw you out of the game: show it, go to the title.
+            traceback.print_exc()
+            self.errors += 1
+            self.good_frames = 0
+            if self.errors > 3:
+                self.running = False
+                return
+            self.reset()
+            self.state = "title"
+        spent = time.perf_counter() - now
+        self.root.after(max(1, int((1.0 / self.fps - spent) * 1000)), self.loop)
+
+    # -----------------------------------------------------------
+    # UPDATE: move everything and check hits (no drawing in here)
+    # -----------------------------------------------------------
+    def update(self):
+        self.t += 1
+        self.update_stars()
+        if self.paused:
+            return
+        self.update_particles()
+        if self.hit_flash > 0:
+            self.hit_flash -= 1
+
+        if self.state == "title":
+            self.update_title()
+        elif self.state == "reward":
+            if self.t % 10 == 0:        # little fireworks
+                self.burst(random.randint(80, WIDTH - 80), random.randint(120, 300),
+                           random.choice(["#ff77ff", "#77ddff", "#ffee77", "#88ff99"]), 12, 3.5)
+            self.reward_timer -= 1
+            if self.reward_timer <= 0:
+                self.level += 1
+                self.start_level()
+        elif self.state == "playing":
+            if self.banner > 0:
+                self.banner -= 1
+            if self.invuln > 0:
+                self.invuln -= 1
+            self.move_player()
+            self.shoot()
+            self.spawn_enemies()
+            self.move_enemies()
+            self.move_boss()
+            self.move_bullets()
+            self.check_hits()
+
+    def update_title(self):
+        # decoration only: the ship on the title screen fires pretend shots
+        if self.t % 14 == 0:
+            self.demo_bullets.append([WIDTH / 2, 575])
+        self.demo_bullets = [[x, y - 9] for x, y in self.demo_bullets if y > 380]
+
+    def update_particles(self):
+        alive = []
+        for p in self.particles:
+            p[0] += p[2]
+            p[1] += p[3]
+            p[4] -= 1
+            if p[4] > 0:
+                alive.append(p)
+        self.particles = alive[-120:]
+
+    def burst(self, x, y, color, count, speed):
+        for _ in range(count):
+            a = random.uniform(0, 2 * math.pi)
+            v = random.uniform(0.3, 1.0) * speed
+            life = random.randint(18, 36)
+            self.particles.append([x, y, math.cos(a) * v, math.sin(a) * v,
+                                   life, life, color, random.choice([2, 3, 3, 4])])
+
+    def move_player(self):
+        if "left" in self.keys or "a" in self.keys:
+            self.px -= PLAYER_SPEED
+        if "right" in self.keys or "d" in self.keys:
+            self.px += PLAYER_SPEED
+        self.px = max(30, min(WIDTH - 30, self.px))
+
+    def shoot(self):
+        self.cooldown = max(self.cooldown - 1, -1)
+        if "space" in self.keys and self.cooldown <= 0:
+            for dx, dy in CANNON_POS[self.cannons]:
+                self.bullets.append([self.px + dx, self.py + dy - 4])
+            self.cooldown += self.fire_delay
+            self.sound.play("shoot")
+
+    def spawn_enemies(self):
+        if self.to_spawn > 0:
+            self.spawn_timer -= 1
+            if self.spawn_timer <= 0:
+                self.spawn_minion(random.randint(40, WIDTH - 40), -20)
+                self.to_spawn -= 1
+                self.spawn_timer = max(16, 42 - self.level)
+        elif not self.enemies and self.boss is None:
+            self.make_boss()            # all minions gone -> the BOSS arrives
+
+    def move_enemies(self):
+        alive = []
+        for e in self.enemies:
+            e["y"] += e["speed"]
+            e["t"] += 1
+            e["x"] = max(20, min(WIDTH - 20, e["x0"] + e["amp"] * math.sin(e["t"] * 0.04)))
+            if self.level >= 2 and e["y"] > 0:       # from level 2 minions shoot
+                e["shoot"] -= 1
+                if e["shoot"] <= 0:
+                    self.enemy_bullets.append([e["x"], e["y"] + 14, 0, 3.6, 1])   # 1 = half a heart
+                    e["shoot"] = max(55, 160 - self.level * 5)
+            if e["y"] < HEIGHT + 30:
+                alive.append(e)
+        self.enemies = alive
+
+    def move_boss(self):
+        b = self.boss
+        if not b:
+            return
+        b["t"] += 1
+        if b["flash"] > 0:
+            b["flash"] -= 1
+        if b["flash_cd"] > 0:
+            b["flash_cd"] -= 1
+        if not b["arrived"]:                        # fly in from the top
+            b["y"] += 2.5
+            if b["y"] >= b["home_y"]:
+                b["arrived"] = True
+            return
+        lvl = self.level
+        enraged = b["hp"] < b["max_hp"] * 0.4       # angry when nearly dead
+        speed = b["speed"] * (1.35 if enraged else 1.0)
+        b["x"] += b["dir"] * speed
+        margin = b["w"] * 0.6 + 4                   # keep the wings on the screen
+        if b["x"] > WIDTH - margin:
+            b["dir"] = -1
+        if b["x"] < margin:
+            b["dir"] = 1
+        b["y"] = b["home_y"] + 8 * math.sin(b["t"] * 0.05)
+
+        # --- boss shots (a boss shot takes a whole heart = 2 half hearts) ---
+        b["attack_timer"] -= 1
+        if b["attack_timer"] <= 0:
+            b["attack_timer"] = max(32, 85 - lvl * 2) * (0.75 if enraged else 1.0)
+            b["attacks"] += 1
+            speed = min(5.0, 3.2 + lvl * 0.1)
+            count = 3 + lvl // 5 + (1 if enraged else 0)
+            for i in range(count):                  # a fan of shots going down
+                ang = math.pi / 2 + (-0.45 + 0.9 * i / (count - 1))
+                self.enemy_bullets.append([b["x"], b["y"] + b["h"] / 2,
+                                           math.cos(ang) * speed, math.sin(ang) * speed, 2])
+            if lvl >= 6:                            # one shot aimed at YOU
+                dx, dy = self.px - b["x"], self.py - b["y"]
+                d = math.hypot(dx, dy) or 1
+                self.enemy_bullets.append([b["x"], b["y"], dx / d * speed * 1.1,
+                                           dy / d * speed * 1.1, 2])
+            if lvl >= 12 and b["attacks"] % 3 == 0:  # a slow ring of small shots
+                for i in range(12):
+                    ang = 2 * math.pi * i / 12
+                    self.enemy_bullets.append([b["x"], b["y"], math.cos(ang) * 2.6,
+                                               math.sin(ang) * 2.6, 1])
+
+        # --- the boss calls in circle-ship minions ---
+        if lvl >= 3:
+            b["summon"] -= 1
+            if b["summon"] <= 0:
+                b["summon"] = max(220, 440 - lvl * 10)
+                if len(self.enemies) < 4:
+                    self.spawn_minion(b["x"] - b["w"] / 2, b["y"] + 20)
+                    self.spawn_minion(b["x"] + b["w"] / 2, b["y"] + 20)
+
+    def move_bullets(self):
+        self.bullets = [[x, y - 11] for x, y in self.bullets if y > -15]
+        moved = []
+        for x, y, vx, vy, dmg in self.enemy_bullets:
+            x += vx
+            y += vy
+            if -10 < x < WIDTH + 10 and -10 < y < HEIGHT + 10:
+                moved.append([x, y, vx, vy, dmg])
+        self.enemy_bullets = moved
+
+    def check_hits(self):
+        boss = self.boss if (self.boss and self.boss["arrived"]) else None
+        remaining = []
+        for bx, by in self.bullets:
+            hit = False
+            for e in self.enemies:
+                if abs(bx - e["x"]) < 18 and abs(by - e["y"]) < 18:
+                    e["hp"] -= 1
+                    hit = True
+                    if e["hp"] <= 0:
+                        self.kill_minion(e)
+                    break
+            if not hit and boss and abs(bx - boss["x"]) < boss["w"] * 0.5 \
+                    and abs(by - boss["y"]) < boss["h"] * 0.5:
+                boss["hp"] -= 1
+                if boss["flash_cd"] == 0:           # quick white blink, not constant
+                    boss["flash"] = 2
+                    boss["flash_cd"] = 12
+                self.score += 1
+                hit = True
+                if random.random() < 0.2:
+                    self.burst(bx, by, "#7fc8ff", 2, 2.5)
+            if not hit:
+                remaining.append([bx, by])
+        self.bullets = remaining
+        self.enemies = [e for e in self.enemies if e["hp"] > 0]
+
+        if boss and boss["hp"] <= 0:
+            self.level_cleared()
+            return
+
+        if self.invuln == 0:                        # their shots / ships hit YOU
+            for eb in self.enemy_bullets:
+                if math.hypot(eb[0] - self.px, eb[1] - (self.py - 2)) < 14:
+                    self.enemy_bullets.remove(eb)
+                    self.lose_hp(eb[4])
+                    return
+            for e in self.enemies:
+                if math.hypot(e["x"] - self.px, e["y"] - self.py) < 28:
+                    self.kill_minion(e)
+                    self.enemies.remove(e)
+                    self.lose_hp(2)                 # crashing into a ship = 1 heart
+                    return
+
+    def kill_minion(self, e):
+        self.score += 10
+        self.burst(e["x"], e["y"], e["color"], 10, 3.2)
+        self.sound.play("boom")
+
+    def lose_hp(self, amount):
+        self.hp = max(0, self.hp - amount)
+        self.invuln = HIT_INVULN                    # short protection after a hit
+        self.hit_flash = 24                         # the hearts blink white
+        self.burst(self.px, self.py, "#ff5577", 12, 3.5)
+        if self.hp <= 0:
+            self.state = "gameover"
+            self.burst(self.px, self.py, "#ffaa55", 30, 5)
+            self.sound.play("gameover", True)
+        else:
+            self.sound.play("hurt", True)
+
+    def level_cleared(self):
+        b = self.boss
+        self.score += 100 * self.level
+        for col in ("#ffdd66", "#ff7755", "#ffffff", "#ff77ff"):
+            self.burst(b["x"], b["y"], col, 20, 6)
+        self.boss = None
+        self.enemy_bullets = []
+        self.enemies = []
+        self.bullets = []
+
+        if self.level >= FINAL_LEVEL:
+            self.state = "win"
+            self.sound.play("win", True)
+            return
+
+        # ----- REWARDS -----
+        self.cleared += 1
+        self.reward_lines = []
+        old = 60 / self.fire_delay
+        self.fire_delay = max(MIN_FIRE_DELAY, self.fire_delay * FIRE_SPEEDUP)
+        self.reward_lines.append("FASTER CANNONS   %.1f -> %.1f shots/sec"
+                                 % (old, 60 / self.fire_delay))
+        if self.cleared % 5 == 0 and self.cannons < MAX_CANNONS:
+            self.cannons += 1
+            self.reward_lines.append("EXTRA CANNON!   now %d cannons" % self.cannons)
+        if self.hp < MAX_HP:
+            self.hp = min(MAX_HP, self.hp + HEAL_PER_BOSS)
+            self.reward_lines.append("+1 HEART")
+        self.state = "reward"
+        self.reward_timer = 170
+        self.sound.play("fanfare", True)            # the victory jingle!
+
+    # -----------------------------------------------------------
+    # DRAWING helpers (things drawn fresh every frame have the tag "dyn")
+    # -----------------------------------------------------------
+    def poly(self, pts, fill, outline="#ffffff", width=1):
+        self.canvas.create_polygon(pts, fill=fill, outline=outline, width=width, tags="dyn")
+
+    def oval(self, x, y, rx, ry, fill="", outline="", width=1):
+        self.canvas.create_oval(x - rx, y - ry, x + rx, y + ry, fill=fill,
+                                outline=outline, width=width, tags="dyn")
+
+    def text(self, x, y, s, size=12, color="#ffffff", anchor="center", bold=True):
+        self.canvas.create_text(x, y, text=s, fill=color, anchor=anchor, tags="dyn",
+                                font=("Arial", size, "bold" if bold else "normal"))
+
+    @staticmethod
+    def rel(x, y, w, h, pts):
+        """Turn shape points written as -1..1 into real screen positions."""
+        flat = []
+        for px, py in pts:
+            flat += [x + px * w / 2, y + py * h / 2]
+        return flat
+
+    # -----------------------------------------------------------
+    # DRAW: put everything on the screen
+    # -----------------------------------------------------------
+    def draw(self):
+        c = self.canvas
+        c.delete("dyn")
+        self.sync_scene()
+        self.draw_stars()
+
+        if self.state == "title":
+            self.pool_mine.update([(x, y, x, y + 13) for x, y in self.demo_bullets])
+            self.pool_theirs.update([])
+            self.pool_sparks.update([])
+            self.draw_title()
+            return
+
+        self.pool_mine.update([(x, y, x, y + 13) for x, y in self.bullets])
+        self.pool_theirs.update([(x - 6, y - 6, x + 6, y + 6) for x, y, vx, vy, dm in self.enemy_bullets])
+        shapes, cols = [], []
+        for x, y, vx, vy, life, maxlife, col, size in self.particles:
+            h = size / 2
+            shapes.append((x - h, y - h, x + h, y + h))
+            cols.append(mix(col, "#07030f", 1 - int(life * 4 / maxlife) / 4.0))
+        self.pool_sparks.update(shapes, cols)
+
+        for e in self.enemies:
+            self.draw_minion(e["x"], e["y"], 16, e["color"], self.t)
+        if self.boss:
+            self.draw_boss()
+        if self.state != "gameover":
+            blink = self.invuln > 0 and (self.invuln // 5) % 2 == 0
+            if not blink:
+                self.draw_player(self.px, self.py, self.cannons)
+
+        self.draw_hud()
+        c.tag_raise("hud")                  # hearts and score always stay on top
+        self.draw_messages()
+
+    # ---- your spaceship ----------------------------------------
+    def draw_player(self, x, y, cannons):
+        flame = 9 + random.random() * 7
+        for s in (-1, 1):                                   # engine flames
+            self.poly([x + s * 8, y + 18, x + s * 5, y + 18 + flame, x + s * 2, y + 18],
+                      "#ff9a3d", "#ffe08a")
+            self.poly([x + s * 6.5, y + 18, x + s * 5, y + 18 + flame * 0.55, x + s * 3.5, y + 18],
+                      "#fff3b0", "")
+        for s in (-1, 1):                                   # swept-back wings
+            self.poly([x + s * 8, y - 2, x + s * 27, y + 15, x + s * 30, y + 26, x + s * 9, y + 17],
+                      "#5b6bd6", "#dfe6ff", 1)
+            self.poly([x + s * 19, y + 10, x + s * 27, y + 15, x + s * 30, y + 26, x + s * 22, y + 20],
+                      "#3fb8ff", "")
+        self.poly([x, y - 32, x + 7, y - 16, x + 10, y + 4, x + 8, y + 18,   # main body
+                   x - 8, y + 18, x - 10, y + 4, x - 7, y - 16],
+                  "#dfe6ff", "#ffffff", 1)
+        self.poly([x, y - 24, x + 3, y - 8, x + 3, y + 14, x - 3, y + 14, x - 3, y - 8],
+                  "#8aa0ff", "")
+        self.poly([x, y - 32, x + 3.5, y - 23, x - 3.5, y - 23], "#ff4d6d", "")   # red nose
+        self.oval(x, y - 6, 4.5, 8.5, fill="#33d6ff", outline="#ffffff")           # cockpit
+        self.oval(x - 1.5, y - 9, 1.3, 3, fill="#ffffff")
+        for dx, dy in CANNON_POS[cannons]:                  # blue cannons
+            self.oval(x + dx, y + dy, 5.5, 5.5, outline="#2f7bff", width=2)
+            self.oval(x + dx, y + dy, 3.5, 3.5, fill="#3fa9ff", outline="#d6ecff")
+
+    # ---- the circle-ship minions -------------------------------
+    def draw_minion(self, x, y, r, color, t):
+        self.oval(x, y, r, r, fill=color, outline="#ffffff", width=2)
+        self.oval(x, y, r * 0.66, r * 0.66, fill=mix(color, "#000000", 0.5), outline="")
+        self.oval(x, y, r * 0.36, r * 0.36, fill="#aef4ff", outline="#ffffff")   # glass dome
+        a = t * 0.09
+        for k in (0, 2):                                    # two spinning lights
+            self.oval(x + math.cos(a + k * math.pi / 2) * r * 0.8,
+                      y + math.sin(a + k * math.pi / 2) * r * 0.8, 2.3, 2.3, fill="#fff3a0")
+
+    # ---- the big bosses ----------------------------------------
+    def draw_boss(self):
+        b = self.boss
+        lvl = self.level
+        hull, plate, glow = BOSS_PALETTES[(lvl - 1) % len(BOSS_PALETTES)]
+        if lvl == FINAL_LEVEL:
+            hull, plate, glow = "#2b0f1f", "#8a1634", "#ff3b3b"
+        if b["flash"] > 0:                                  # flash white when hit
+            hull, plate = mix(hull, "#ffffff", 0.6), mix(plate, "#ffffff", 0.6)
+        pulse = 0.5 + 0.5 * math.sin(self.t * 0.12)
+        args = (b["x"], b["y"], b["w"], b["h"], hull, plate, glow, pulse)
+        if lvl == FINAL_LEVEL:
+            self.boss_dreadnought(*args)
+        else:
+            [self.boss_warship, self.boss_manta, self.boss_fortress,
+             self.boss_crab, self.boss_stinger][(lvl - 1) % 5](*args)
+
+        # health bar
+        frac = max(0, b["hp"]) / b["max_hp"]
+        bar = mix("#ff3333", "#ffcc33", frac)
+        self.canvas.create_rectangle(60, 32, WIDTH - 60, 43, outline="#ffffff", tags="dyn")
+        self.canvas.create_rectangle(61, 33, 61 + (WIDTH - 122) * frac, 42, fill=bar,
+                                     outline="", tags="dyn")
+        name = BOSS_NAMES[lvl - 1]
+        self.text(WIDTH / 2, 20, ("FINAL BOSS - " if lvl == FINAL_LEVEL else "BOSS - ") + name,
+                  11, "#ffffff")
+
+    def glow_orb(self, x, y, r, color, pulse):
+        self.oval(x, y, r + 4 + 3 * pulse, r + 4 + 3 * pulse, fill=mix(color, "#000000", 0.55))
+        self.oval(x, y, r, r, fill=color, outline="#ffffff", width=1)
+        self.oval(x, y, r * 0.45, r * 0.45, fill="#ffffff")
+
+    def boss_warship(self, x, y, w, h, hull, plate, glow, pulse):
+        P = lambda pts: self.rel(x, y, w, h, pts)
+        edge = mix(hull, "#ffffff", 0.7)
+        for s in (-1, 1):
+            self.poly(P([(s * 0.4 - 0.12, -0.9), (s * 0.4, -1.2 - 0.15 * pulse), (s * 0.4 + 0.12, -0.9)]),
+                      "#ffb347", "#fff3c0")
+            self.poly(P([(s * 0.5, -0.6), (s * 1.1, -0.1), (s * 1.1, 0.5), (s * 0.8, 0.95), (s * 0.5, 0.4)]),
+                      hull, edge, 2)
+            self.poly(P([(s * 0.8 - 0.08, 0.5), (s * 0.8 + 0.08, 0.5), (s * 0.8 + 0.08, 1.05), (s * 0.8 - 0.08, 1.05)]),
+                      plate, edge)
+            self.oval(x + s * 0.8 * w / 2, y + 1.05 * h / 2, 5, 5, fill=glow, outline="#ffffff")
+        self.poly(P([(-0.55, -0.95), (0.55, -0.95), (0.85, -0.2), (0.6, 0.75), (0.25, 1), (-0.25, 1),
+                     (-0.6, 0.75), (-0.85, -0.2)]), hull, edge, 2)
+        self.poly(P([(-0.35, -0.7), (0.35, -0.7), (0.55, -0.15), (0.4, 0.5), (-0.4, 0.5), (-0.55, -0.15)]),
+                  plate, edge)
+        self.glow_orb(x, y - 0.05 * h / 2, 0.2 * h / 2 + 3, glow, pulse)
+
+    def boss_manta(self, x, y, w, h, hull, plate, glow, pulse):
+        P = lambda pts: self.rel(x, y, w, h, pts)
+        edge = mix(hull, "#ffffff", 0.7)
+        self.poly(P([(-0.07, 0.9), (0, 1.35), (0.07, 0.9)]), plate, edge)          # tail spike
+        self.poly(P([(0, -0.95), (1.1, -0.5), (1.0, 0.0), (0.45, 0.1), (0.3, 0.75), (0, 1.0),
+                     (-0.3, 0.75), (-0.45, 0.1), (-1.0, 0.0), (-1.1, -0.5)]), hull, edge, 2)
+        self.poly(P([(0, -0.7), (0.7, -0.4), (0.35, 0.0), (0.2, 0.6), (0, 0.8), (-0.2, 0.6),
+                     (-0.35, 0.0), (-0.7, -0.4)]), plate, edge)
+        for s in (-1, 1):
+            self.canvas.create_line(*P([(s * 0.25, -0.45), (s * 0.9, -0.3)]), fill=glow, width=3,
+                                    capstyle="round", tags="dyn")
+            self.oval(x + s * 0.15 * w / 2, y - 0.1 * h / 2, 7, 7 + 2 * pulse, fill=glow, outline="#ffffff")
+            self.oval(x + s * 1.0 * w / 2, y - 0.05 * h / 2, 5, 5, fill=glow, outline="#ffffff")
+
+    def boss_fortress(self, x, y, w, h, hull, plate, glow, pulse):
+        P = lambda pts: self.rel(x, y, w, h, pts)
+        edge = mix(hull, "#ffffff", 0.7)
+        for sx in (-0.7, 0, 0.7):                                                  # towers
+            self.poly(P([(sx - 0.2, -1.05), (sx + 0.2, -1.05), (sx + 0.2, -0.8), (sx - 0.2, -0.8)]), plate, edge)
+        self.poly(P([(-0.9, -0.85), (0.9, -0.85), (0.9, 0.55), (-0.9, 0.55)]), hull, edge, 2)
+        self.poly(P([(-0.75, -0.6), (0.75, -0.6), (0.75, 0.3), (-0.75, 0.3)]), plate, edge)
+        for i in range(5):                                                         # lit windows
+            wx = -0.6 + 0.3 * i
+            lit = glow if (i + int(self.t / 12)) % 2 == 0 else mix(glow, "#000000", 0.6)
+            self.poly(P([(wx - 0.06, -0.35), (wx + 0.06, -0.35), (wx + 0.06, -0.05), (wx - 0.06, -0.05)]), lit, "")
+        for sx in (-0.65, 0, 0.65):                                                # turrets
+            bw = 0.11 if sx == 0 else 0.08
+            self.poly(P([(sx - bw, 0.55), (sx + bw, 0.55), (sx + bw, 1.1), (sx - bw, 1.1)]), plate, edge)
+            self.oval(x + sx * w / 2, y + 1.1 * h / 2, 6, 6, fill=glow, outline="#ffffff")
+        self.glow_orb(x, y - 0.7 * h / 2 + 2, 8, glow, pulse)
+
+    def boss_crab(self, x, y, w, h, hull, plate, glow, pulse):
+        P = lambda pts: self.rel(x, y, w, h, pts)
+        edge = mix(hull, "#ffffff", 0.7)
+        for lx in (-0.35, 0, 0.35):                                                # legs
+            self.canvas.create_line(*P([(lx * 0.8, 0.5), (lx * 1.8, 1.1)]), fill=edge, width=4,
+                                    capstyle="round", tags="dyn")
+        for s in (-1, 1):                                                          # claws
+            self.poly(P([(s * 0.55, -0.2), (s * 1.0, -0.8), (s * 1.2, -0.1), (s * 1.0, 0.65),
+                         (s * 0.85, 0.1), (s * 0.65, 0.3)]), hull, edge, 2)
+            self.poly(P([(s * 0.9, -0.5), (s * 1.1, -0.1), (s * 0.95, 0.35), (s * 0.85, 0.0)]), plate, edge)
+            self.oval(x + s * 1.05 * w / 2, y + 0.55 * h / 2, 5, 5, fill=glow, outline="#ffffff")
+        self.poly(P([(-0.5, -0.7), (0.5, -0.7), (0.75, 0), (0.45, 0.75), (-0.45, 0.75), (-0.75, 0)]), hull, edge, 2)
+        self.poly(P([(-0.3, -0.45), (0.3, -0.45), (0.5, 0), (0.3, 0.5), (-0.3, 0.5), (-0.5, 0)]), plate, edge)
+        for s in (-1, 1):                                                          # eyes on stalks
+            self.canvas.create_line(*P([(s * 0.2, -0.6), (s * 0.3, -1.05)]), fill=edge, width=3, tags="dyn")
+            self.glow_orb(x + s * 0.3 * w / 2, y - 1.05 * h / 2, 8, glow, pulse)
+
+    def boss_stinger(self, x, y, w, h, hull, plate, glow, pulse):
+        P = lambda pts: self.rel(x, y, w, h, pts)
+        edge = mix(hull, "#ffffff", 0.7)
+        self.poly(P([(0, 1.15), (0.3, 0.3), (1.05, 0.15), (0.45, -0.2), (0.6, -1.05), (0, -0.55),
+                     (-0.6, -1.05), (-0.45, -0.2), (-1.05, 0.15), (-0.3, 0.3)]), hull, edge, 2)
+        self.poly(P([(0, 0.85), (0.2, 0.25), (0.6, 0.1), (0.3, -0.2), (0, -0.3), (-0.3, -0.2),
+                     (-0.6, 0.1), (-0.2, 0.25)]), plate, edge)
+        for s in (-1, 1):
+            self.oval(x + s * 0.6 * w / 2, y - 0.95 * h / 2, 4, 4, fill=glow, outline="#ffffff")
+            self.oval(x + s * 1.05 * w / 2, y + 0.15 * h / 2, 5, 5, fill=glow, outline="#ffffff")
+        self.oval(x, y + 1.15 * h / 2, 5, 5, fill=glow, outline="#ffffff")
+        self.glow_orb(x, y - 0.05 * h / 2, 12, glow, pulse)
+
+    def boss_dreadnought(self, x, y, w, h, hull, plate, glow, pulse):
+        """The FINAL boss: bigger, with a golden crown and a burning red core."""
+        P = lambda pts: self.rel(x, y, w, h, pts)
+        edge = mix(hull, "#ffffff", 0.7)
+        gold = "#ffcc33"
+        for s in (-1, 1):
+            self.poly(P([(s * 0.4, -0.7), (s * 1.15, -0.95), (s * 1.1, -0.4), (s * 1.2, 0.1),
+                         (s * 0.95, 0.3), (s * 0.9, 0.8), (s * 0.45, 0.5)]), hull, edge, 2)
+            self.poly(P([(s * 0.55, -0.5), (s * 1.0, -0.7), (s * 0.95, -0.2), (s * 0.6, 0.0)]), plate, edge)
+            for k in (0, 1):
+                gx, gy = s * (0.72 + 0.2 * k), 0.5 + 0.25 * k
+                self.poly(P([(gx - 0.05, gy), (gx + 0.05, gy), (gx + 0.05, gy + 0.3), (gx - 0.05, gy + 0.3)]),
+                          plate, edge)
+                self.oval(x + gx * w / 2, y + (gy + 0.3) * h / 2, 5, 5, fill=glow, outline="#ffffff")
+        self.poly(P([(-0.5, -0.9), (0.5, -0.9), (0.7, -0.3), (0.55, 0.7), (0.25, 1.0), (-0.25, 1.0),
+                     (-0.55, 0.7), (-0.7, -0.3)]), hull, edge, 2)
+        for i in range(5):                                                         # golden crown
+            xx = -0.4 + 0.2 * i
+            tip = -1.35 if i % 2 == 0 else -1.15
+            self.poly(P([(xx - 0.08, -0.88), (xx, tip), (xx + 0.08, -0.88)]), gold, "#fff0b0")
+        self.poly(P([(-0.4, -0.6), (0.4, -0.6), (0.5, -0.1), (0.35, 0.55), (-0.35, 0.55), (-0.5, -0.1)]),
+                  plate, edge)
+        for sx in (-0.35, 0, 0.35):
+            self.poly(P([(sx - 0.06, 0.7), (sx + 0.06, 0.7), (sx + 0.06, 1.1), (sx - 0.06, 1.1)]), gold, "#fff0b0")
+            self.oval(x + sx * w / 2, y + 1.1 * h / 2, 5, 5, fill=glow, outline="#ffffff")
+        self.glow_orb(x, y - 0.05 * h / 2, 20 + 5 * pulse, glow, pulse)
+        self.oval(x, y - 0.05 * h / 2, 30 + 5 * pulse, 30 + 5 * pulse, outline=gold, width=3)
+
+    # ---- hearts, score, messages -------------------------------
+    def draw_hud(self):
+        self.set_text(self.hud_level, "LEVEL %d / %d" % (self.level, FINAL_LEVEL))
+        self.set_text(self.hud_score, "SCORE  %d" % self.score)
+        self.set_text(self.hud_info, "CANNONS %d    FIRE %.1f/sec" %
+                      (self.cannons, 60 / self.fire_delay * self.cannons))
+        self.update_hearts()
+
+    def update_hearts(self):
+        """Hardcore hearts: 10 hearts, half hearts, white blink when hurt,
+        and they shake when you are nearly dead."""
+        c = self.canvas
+        blink = self.hit_flash > 0 and (self.hit_flash // 4) % 2 == 0
+        for i in range(HEARTS):
+            whole = 2 * (i + 1)
+            kind = "full" if self.hp >= whole else ("half" if self.hp == whole - 1 else "empty")
+            key = (kind, blink)
+            if self.heart_shown[i] != key:
+                c.itemconfigure(self.heart_items[i], image=self.heart_imgs[key])
+                self.heart_shown[i] = key
+        shaking = 0 < self.hp <= 4
+        if shaking or self.hearts_shaking:
+            for i in range(HEARTS):
+                x, y = self.heart_pos[i]
+                c.coords(self.heart_items[i], x, y + (random.choice((-3, 0, 3)) if shaking else 0))
+            self.hearts_shaking = shaking
+
+    def draw_messages(self):
+        c = self.canvas
+        mid = WIDTH / 2
+        if self.paused:
+            stroke_text(c, "PAUSED", mid, 330, 8, 9, "#ffffff", "#6a3fc0", 3)
+            self.text(mid, 390, "press P to continue", 13, "#d8c4ff", bold=False)
+
+        if self.state == "playing" and self.banner > 0:
+            if self.boss and self.level == FINAL_LEVEL:
+                stroke_text(c, "FINAL BOSS", mid, 380, 6.5, 7.5, "#ffdd55", "#a01010", 3)
+            elif self.boss:
+                if (self.banner // 8) % 2 == 0:
+                    stroke_text(c, "WARNING!", mid, 380, 6.5, 7.5, "#ff5566", "#601020", 3)
+            elif self.banner > 20:
+                stroke_text(c, "LEVEL %d" % self.level, mid, 330, 7, 8, "#ffffff", "#6a3fc0", 3)
+
+        if self.state == "reward":
+            stroke_text(c, "LEVEL %d CLEARED!" % self.level, mid, 250, 4.8, 6, "#7dffa0", "#146030", 3)
+            self.text(mid, 315, "REWARD", 18, "#ffe066")
+            for i, line in enumerate(self.reward_lines):
+                self.text(mid, 355 + i * 30, line, 15, "#ffffff")
+
+        if self.state == "gameover":
+            stroke_text(c, "GAME OVER", mid, 270, 8, 9.5, "#ff5566", "#601020", 4)
+            self.text(mid, 340, "You reached level %d   -   Score %d" % (self.level, self.score), 15)
+            self.text(mid, 385, "Press  R  to try again", 15, "#ffe066")
+
+        if self.state == "win":
+            stroke_text(c, "YOU WIN!", mid, 250, 9, 10, "#7dffa0", "#146030", 4)
+            self.text(mid, 325, "You destroyed the FINAL BOSS!", 16)
+            self.text(mid, 360, "Final score: %d" % self.score, 16)
+            self.text(mid, 405, "Press  R  to play again", 15, "#ffe066")
+
+    # -----------------------------------------------------------
+    # THE TITLE (ENTRANCE) SCREEN - the moving parts
+    # (planet and letters were drawn once in build_title)
+    # -----------------------------------------------------------
+    def draw_title(self):
+        c = self.canvas
+        t = self.t
+        mid = WIDTH / 2
+
+        # glowing title colour cycles, the "press space" text blinks
+        if self.draw_count % 4 == 0:
+            cycle = 0.5 + 0.5 * math.sin(t * 0.04)
+            c.itemconfigure("tglow", fill=mix("#5a2fd0", "#d02fb0", round(cycle, 1)))
+        on = (t // 30) % 2 == 0
+        if on != self.blink:
+            c.itemconfigure("press", state="normal" if on else "hidden")
+            self.blink = on
+        if not self.sound.mode:
+            self.set_text(self.title_sound, "(no sound player found on this computer)")
+
+        # a boss floats in the middle, with circle minions orbiting it
+        n = (t // 240) % 5
+        bx, by = mid + 60 * math.sin(t * 0.015), 345 + 8 * math.sin(t * 0.04)
+        hull, plate, glow = BOSS_PALETTES[n]
+        pulse = 0.5 + 0.5 * math.sin(t * 0.12)
+        [self.boss_warship, self.boss_manta, self.boss_fortress,
+         self.boss_crab, self.boss_stinger][n](bx, by, 150, 90, hull, plate, glow, pulse)
+        for k in range(6):
+            a = t * 0.03 + k * math.pi / 3
+            self.draw_minion(bx + math.cos(a) * 135, by + math.sin(a) * 52,
+                             11, MINION_COLORS[k % len(MINION_COLORS)], t)
+
+        # the player's ship hovers at the bottom
+        self.draw_player(mid, 585 + 4 * math.sin(t * 0.07), 3)
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    Game(root)
+    root.mainloop()
